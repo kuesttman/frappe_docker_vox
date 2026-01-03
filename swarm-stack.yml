@@ -1,27 +1,41 @@
-name: frappe_docker
+version: "3.8"
+
 services:
   backend:
-    image: frappe/erpnext:${ERPNEXT_VERSION}
+    image: frappe/erpnext:${ERPNEXT_VERSION:-v15.93.1}
     networks:
       - frappe_network
     deploy:
+      mode: replicated
+      replicas: 1
       restart_policy:
         condition: on-failure
+        delay: 5s
+        max_attempts: 3
+      resources:
+        limits:
+          memory: 1G
+        reservations:
+          memory: 512M
     volumes:
       - apps:/home/frappe/frappe-bench/apps
       - sites:/home/frappe/frappe-bench/sites
       - logs:/home/frappe/frappe-bench/logs
     environment:
-      DB_HOST: ${DB_HOST}
-      DB_PORT: ${DB_PORT}
-      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}
-      MARIADB_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}
+      DB_HOST: db
+      DB_PORT: "3306"
+      MYSQL_ROOT_PASSWORD_FILE: /run/secrets/db_root_password
+      MARIADB_ROOT_PASSWORD_FILE: /run/secrets/db_root_password
+    secrets:
+      - db_root_password
 
   configurator:
-    image: frappe/erpnext:${ERPNEXT_VERSION}
+    image: frappe/erpnext:${ERPNEXT_VERSION:-v15.93.1}
     networks:
       - frappe_network
     deploy:
+      mode: replicated
+      replicas: 1
       restart_policy:
         condition: none
     entrypoint:
@@ -37,21 +51,23 @@ services:
         bench set-config -g redis_socketio "redis://$$REDIS_QUEUE";
         bench set-config -gp socketio_port $$SOCKETIO_PORT;
     environment:
-      DB_HOST: ${DB_HOST}
-      DB_PORT: ${DB_PORT}
-      REDIS_CACHE: ${REDIS_CACHE}
-      REDIS_QUEUE: ${REDIS_QUEUE}
-      SOCKETIO_PORT: ${SOCKETIO_PORT}
+      DB_HOST: db
+      DB_PORT: "3306"
+      REDIS_CACHE: redis-cache:6379
+      REDIS_QUEUE: redis-queue:6379
+      SOCKETIO_PORT: "9000"
     volumes:
       - apps:/home/frappe/frappe-bench/apps
       - sites:/home/frappe/frappe-bench/sites
       - logs:/home/frappe/frappe-bench/logs
 
   create-site:
-    image: frappe/erpnext:${ERPNEXT_VERSION}
+    image: frappe/erpnext:${ERPNEXT_VERSION:-v15.93.1}
     networks:
       - frappe_network
     deploy:
+      mode: replicated
+      replicas: 1
       restart_policy:
         condition: none
     volumes:
@@ -79,67 +95,109 @@ services:
           fi
         done;
         echo "sites/common_site_config.json found";
-        bench new-site --mariadb-user-host-login-scope='%' --admin-password=${DB_PASSWORD} --db-root-username=root --db-root-password=${DB_ROOT_PASSWORD} --install-app erpnext --set-default frontend;
-    environment:
-      DB_PASSWORD: ${DB_PASSWORD}
-      DB_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}
+        export DB_ROOT_PASSWORD=$(cat /run/secrets/db_root_password);
+        export ADMIN_PASSWORD=$(cat /run/secrets/admin_password);
+        bench new-site --mariadb-user-host-login-scope='%' --admin-password=$$ADMIN_PASSWORD --db-root-username=root --db-root-password=$$DB_ROOT_PASSWORD --install-app erpnext --set-default frontend;
+    secrets:
+      - db_root_password
+      - admin_password
 
   db:
     image: mariadb:10.6
     networks:
       - frappe_network
     healthcheck:
-      test: mysqladmin ping -h localhost --password=${DB_PASSWORD}
-      interval: 1s
-      retries: 20
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
     deploy:
+      mode: replicated
+      replicas: 1
       restart_policy:
         condition: on-failure
+        delay: 5s
+        max_attempts: 3
+      resources:
+        limits:
+          memory: 1G
+        reservations:
+          memory: 256M
+      placement:
+        constraints:
+          - node.role == manager
     command:
       - --character-set-server=utf8mb4
       - --collation-server=utf8mb4_unicode_ci
       - --skip-character-set-client-handshake
-      - --skip-innodb-read-only-compressed # Temporary fix for MariaDB 10.6
+      - --skip-innodb-read-only-compressed
     environment:
-      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}
-      MARIADB_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}
+      MYSQL_ROOT_PASSWORD_FILE: /run/secrets/db_root_password
+      MARIADB_ROOT_PASSWORD_FILE: /run/secrets/db_root_password
+    secrets:
+      - db_root_password
     volumes:
       - db-data:/var/lib/mysql
 
   frontend:
-    image: frappe/erpnext:${ERPNEXT_VERSION}
+    image: frappe/erpnext:${ERPNEXT_VERSION:-v15.93.1}
     networks:
       - frappe_network
-    depends_on:
-      - websocket
     deploy:
+      mode: replicated
+      replicas: 1
       restart_policy:
         condition: on-failure
+        delay: 5s
+        max_attempts: 3
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 128M
+      labels:
+        - "traefik.enable=true"
+        - "traefik.http.routers.frontend.rule=Host(`${SITE_NAME:-erp.example.com}`)"
+        - "traefik.http.routers.frontend.entrypoints=websecure"
+        - "traefik.http.routers.frontend.tls.certresolver=letsencrypt"
+        - "traefik.http.services.frontend.loadbalancer.server.port=8080"
     command:
       - nginx-entrypoint.sh
     environment:
       BACKEND: backend:8000
-      FRAPPE_SITE_NAME_HEADER: ${FRAPPE_SITE_NAME_HEADER}
+      FRAPPE_SITE_NAME_HEADER: ${FRAPPE_SITE_NAME_HEADER:-frontend}
       SOCKETIO: websocket:9000
-      UPSTREAM_REAL_IP_ADDRESS: ${UPSTREAM_REAL_IP_ADDRESS}
-      UPSTREAM_REAL_IP_HEADER: ${UPSTREAM_REAL_IP_HEADER}
-      UPSTREAM_REAL_IP_RECURSIVE: ${UPSTREAM_REAL_IP_RECURSIVE}
-      PROXY_READ_TIMEOUT: ${PROXY_READ_TIMEOUT}
-      CLIENT_MAX_BODY_SIZE: ${CLIENT_MAX_BODY_SIZE}
+      UPSTREAM_REAL_IP_ADDRESS: ${UPSTREAM_REAL_IP_ADDRESS:-127.0.0.1}
+      UPSTREAM_REAL_IP_HEADER: ${UPSTREAM_REAL_IP_HEADER:-X-Forwarded-For}
+      UPSTREAM_REAL_IP_RECURSIVE: ${UPSTREAM_REAL_IP_RECURSIVE:-off}
+      PROXY_READ_TIMEOUT: ${PROXY_READ_TIMEOUT:-120}
+      CLIENT_MAX_BODY_SIZE: ${CLIENT_MAX_BODY_SIZE:-50m}
     volumes:
       - apps:/home/frappe/frappe-bench/apps
       - sites:/home/frappe/frappe-bench/sites
       - logs:/home/frappe/frappe-bench/logs
     ports:
-      - "8080:8080"
+      - target: 8080
+        published: 8080
+        protocol: tcp
+        mode: ingress
 
   queue-long:
-    image: frappe/erpnext:${ERPNEXT_VERSION}
+    image: frappe/erpnext:${ERPNEXT_VERSION:-v15.93.1}
     networks:
       - frappe_network
     deploy:
+      mode: replicated
+      replicas: 1
       restart_policy:
         condition: on-failure
+        delay: 5s
+        max_attempts: 3
+      resources:
+        limits:
+          memory: 1G
+        reservations:
+          memory: 256M
     command:
       - bench
       - worker
@@ -150,16 +208,25 @@ services:
       - sites:/home/frappe/frappe-bench/sites
       - logs:/home/frappe/frappe-bench/logs
     environment:
-      FRAPPE_REDIS_CACHE: redis://${REDIS_CACHE}
-      FRAPPE_REDIS_QUEUE: redis://${REDIS_QUEUE}
+      FRAPPE_REDIS_CACHE: redis://redis-cache:6379
+      FRAPPE_REDIS_QUEUE: redis://redis-queue:6379
 
   queue-short:
-    image: frappe/erpnext:${ERPNEXT_VERSION}
+    image: frappe/erpnext:${ERPNEXT_VERSION:-v15.93.1}
     networks:
       - frappe_network
     deploy:
+      mode: replicated
+      replicas: 1
       restart_policy:
         condition: on-failure
+        delay: 5s
+        max_attempts: 3
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 128M
     command:
       - bench
       - worker
@@ -170,16 +237,25 @@ services:
       - sites:/home/frappe/frappe-bench/sites
       - logs:/home/frappe/frappe-bench/logs
     environment:
-      FRAPPE_REDIS_CACHE: redis://${REDIS_CACHE}
-      FRAPPE_REDIS_QUEUE: redis://${REDIS_QUEUE}
+      FRAPPE_REDIS_CACHE: redis://redis-cache:6379
+      FRAPPE_REDIS_QUEUE: redis://redis-queue:6379
 
   redis-queue:
     image: redis:6.2-alpine
     networks:
       - frappe_network
     deploy:
+      mode: replicated
+      replicas: 1
       restart_policy:
         condition: on-failure
+        delay: 5s
+        max_attempts: 3
+      resources:
+        limits:
+          memory: 128M
+        reservations:
+          memory: 64M
     volumes:
       - redis-queue-data:/data
 
@@ -188,16 +264,34 @@ services:
     networks:
       - frappe_network
     deploy:
+      mode: replicated
+      replicas: 1
       restart_policy:
         condition: on-failure
+        delay: 5s
+        max_attempts: 3
+      resources:
+        limits:
+          memory: 128M
+        reservations:
+          memory: 64M
 
   scheduler:
-    image: frappe/erpnext:${ERPNEXT_VERSION}
+    image: frappe/erpnext:${ERPNEXT_VERSION:-v15.93.1}
     networks:
       - frappe_network
     deploy:
+      mode: replicated
+      replicas: 1
       restart_policy:
         condition: on-failure
+        delay: 5s
+        max_attempts: 3
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 128M
     command:
       - bench
       - schedule
@@ -207,18 +301,27 @@ services:
       - logs:/home/frappe/frappe-bench/logs
 
   websocket:
-    image: frappe/erpnext:${ERPNEXT_VERSION}
+    image: frappe/erpnext:${ERPNEXT_VERSION:-v15.93.1}
     networks:
       - frappe_network
     deploy:
+      mode: replicated
+      replicas: 1
       restart_policy:
         condition: on-failure
+        delay: 5s
+        max_attempts: 3
+      resources:
+        limits:
+          memory: 256M
+        reservations:
+          memory: 64M
     command:
       - node
       - /home/frappe/frappe-bench/apps/frappe/socketio.js
     environment:
-      FRAPPE_REDIS_CACHE: redis://${REDIS_CACHE}
-      FRAPPE_REDIS_QUEUE: redis://${REDIS_QUEUE}
+      FRAPPE_REDIS_CACHE: redis://redis-cache:6379
+      FRAPPE_REDIS_QUEUE: redis://redis-queue:6379
     volumes:
       - apps:/home/frappe/frappe-bench/apps
       - sites:/home/frappe/frappe-bench/sites
@@ -226,11 +329,23 @@ services:
 
 volumes:
   apps:
+    driver: local
   db-data:
+    driver: local
   redis-queue-data:
+    driver: local
   sites:
+    driver: local
   logs:
+    driver: local
 
 networks:
   frappe_network:
-    driver: bridge
+    driver: overlay
+    attachable: true
+
+secrets:
+  db_root_password:
+    external: true
+  admin_password:
+    external: true
