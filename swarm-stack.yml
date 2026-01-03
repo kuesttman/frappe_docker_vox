@@ -95,8 +95,8 @@ services:
           fi
         done;
         echo "sites/common_site_config.json found";
-        export DB_ROOT_PASSWORD=$(cat /run/secrets/db_root_password);
-        export ADMIN_PASSWORD=$(cat /run/secrets/admin_password);
+        export DB_ROOT_PASSWORD=$$(cat /run/secrets/db_root_password);
+        export ADMIN_PASSWORD=$$(cat /run/secrets/admin_password);
         bench new-site --mariadb-user-host-login-scope='%' --admin-password=$$ADMIN_PASSWORD --db-root-username=root --db-root-password=$$DB_ROOT_PASSWORD --install-app erpnext --set-default frontend;
     secrets:
       - db_root_password
